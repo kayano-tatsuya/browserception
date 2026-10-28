@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browserception</title>
+<style>
+:root{--bg:#e8eaed;--tab:#d3d6db;--bar:#fff;--fg:#202124;--mute:#5f6368;--acc:#1a73e8;--line:#c4c7cc;--field:#f1f3f4}
+@media (prefers-color-scheme:dark){:root{--bg:#202124;--tab:#2d2e31;--bar:#35363a;--fg:#e8eaed;--mute:#9aa0a6;--acc:#8ab4f8;--line:#4a4c50;--field:#202124}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-direction:column}
+#tabs{display:flex;align-items:flex-end;gap:2px;padding:6px 8px 0;overflow-x:auto}
+.tab{display:flex;align-items:center;gap:6px;width:170px;flex:0 0 auto;padding:7px 8px 7px 12px;background:var(--tab);border-radius:9px 9px 0 0;cursor:pointer;color:var(--mute)}
+.tab.on{background:var(--bar);color:var(--fg)}
+.tab span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button{font:inherit;color:inherit;background:none;border:0;border-radius:50%;width:30px;height:30px;cursor:pointer;display:grid;place-items:center;flex:0 0 auto}
+button:hover:not(:disabled){background:rgba(128,128,128,.2)}
+button:disabled{opacity:.35;cursor:default}
+.tab button{width:20px;height:20px;font-size:12px}
+#bar{display:flex;align-items:center;gap:4px;padding:6px 8px;background:var(--bar);border-bottom:1px solid var(--line)}
+#url{flex:1;min-width:0;height:32px;border:1px solid transparent;border-radius:16px;background:var(--field);color:var(--fg);padding:0 14px;font:inherit;outline:0}
+#url:focus{border-color:var(--acc)}
+#load{height:3px;background:var(--acc);width:0;transition:width .3s}
+#view{flex:1;position:relative;min-height:0;background:#fff}
+iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff;display:none}
+iframe.on{display:block}
+.page{position:absolute;inset:0;background:var(--bg);display:none;flex-direction:column;align-items:center;padding:12vh 16px 0;overflow:auto;text-align:center}
+.page h1{font-weight:500;font-size:32px;margin:0 0 16px}
+.page form{width:min(560px,100%)}
+.page input{width:100%;height:44px;border-radius:22px;border:1px solid var(--line);background:var(--bar);color:var(--fg);padding:0 20px;font:inherit;font-size:16px;outline:0}
+.page p{color:var(--mute);max-width:520px;line-height:1.5}
+#tiles{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:24px}
+.tile{padding:8px 16px;border-radius:18px;background:var(--bar);cursor:pointer}
+.tile:hover{outline:1px solid var(--acc)}
+</style>
+</head>
+<body>
+<div id="tabs"></div>
+<div id="bar">
+  <button id="back" title="Back">←</button>
+  <button id="fwd" title="Forward">→</button>
+  <button id="reload" title="Reload">⟳</button>
+  <button id="homebtn" title="Home">⌂</button>
+  <input id="url" placeholder="Search or enter address" autocomplete="off" spellcheck="false">
+</div>
+<div id="load"></div>
+<div id="view"><div class="page" id="home"></div><div class="page" id="err"></div></div>
+
+<script>
+// ---- How fetching works -------------------------------------------------
+// 1. fetch() the page HTML through a public CORS proxy (tried in order).
+// 2. Parse it, drop scripts, add <base href> so images/CSS load from the real site.
+// 3. Inject a tiny script that reports link clicks / form submits to us.
+// 4. Show the result in a sandboxed iframe via srcdoc.
+const PROXIES=[
+  u=>'https://corsproxy.io/?url='+encodeURIComponent(u),
+  u=>'https://api.allorigins.win/raw?url='+encodeURIComponent(u),
+  u=>'https://api.codetabs.com/v1/proxy?quest='+encodeURIComponent(u)
+];
+const SEARCH='https://en.wikipedia.org/w/index.php?search='; // swap for any engine's query URL
+const HOME='about:home';
+const SITES=[['Wikipedia','https://en.wikipedia.org/wiki/Main_Page'],['Example','https://example.com'],['Hacker News','https://news.ycombinator.com'],['Lite CNN','https://lite.cnn.com'],['Text NPR','https://text.npr.org'],['Old Reddit','https://old.reddit.com']];
+
+const INJECT=`
+document.addEventListener('click',function(e){
+  var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;
+  var h=a.getAttribute('href');
+  if(!h||/^(javascript|mailto|tel):/i.test(h))return;
+  e.preventDefault();
+  if(h[0]==='#'){var el=document.getElementById(h.slice(1))||document.getElementsByName(h.slice(1))[0];if(el)el.scrollIntoView();return}
+  parent.postMessage({bc:'nav',url:a.href},'*');
+},true);
+document.addEventListener('submit',function(e){
+  e.preventDefault();var f=e.target;
+  var u=new URL(f.action||document.baseURI);
+  new FormData(f).forEach(function(v,k){if(typeof v==='string')u.searchParams.set(k,v)});
+  parent.postMessage({bc:'nav',url:u.href},'*');
+},true);`;
+
+const $=id=>document.getElementById(id);
+let tabs=[],cur=null;
+
+async function fetchHTML(url){
+  let last;
+  for(const p of PROXIES){
+    try{
+      const r=await fetch(p(url));
+      if(!r.ok)throw new Error('Proxy returned HTTP '+r.status);
+      return await r.text();
+    }catch(e){last=e}
+  }
+  throw last||new Error('All proxies failed');
+}
+
+function norm(s){
+  s=s.trim();if(!s)return HOME;
+  if(s===HOME)return s;
+  if(/^https?:\/\//i.test(s))return s;
+  if(/^[^\s]+\.[a-z]{2,}(\/.*)?$/i.test(s))return 'https://'+s;
+  return SEARCH+encodeURIComponent(s);
+}
+
+function newTab(u=HOME){
+  const f=document.createElement('iframe');
+  f.setAttribute('sandbox','allow-scripts');
+  $('view').appendChild(f);
+  const t={title:'New Tab',hist:[],i:-1,f,url:HOME,error:null};
+  tabs.push(t);cur=t;go(t,u);
+}
+function go(t,input,push=true){
+  const u=norm(input);
+  if(push){t.hist=t.hist.slice(0,t.i+1);t.hist.push(u);t.i++}
+  load(t,u);
+}
+async function load(t,u){
+  t.url=u;t.error=null;
+  const token=t.token=Math.random();
+  if(u===HOME){t.title='New Tab';t.f.removeAttribute('srcdoc');return render()}
+  t.title=u.replace(/^https?:\/\/(www\.)?/,'');
+  render();progress(t,30);
+  try{
+    const html=await fetchHTML(u);
+    if(t.token!==token)return;
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    doc.querySelectorAll('script,noscript,base,meta[http-equiv]').forEach(n=>n.remove());
+    const base=doc.createElement('base');base.href=u;doc.head.prepend(base);
+    const s=doc.createElement('script');s.textContent=INJECT;doc.body.append(s);
+    t.title=(doc.title||'').trim()||t.title;
+    t.f.srcdoc='<!DOCTYPE html>'+doc.documentElement.outerHTML;
+  }catch(e){
+    if(t.token!==token)return;
+    t.error=e.message||String(e);
+  }
+  progress(t,100);render();
+}
+function progress(t,p){
+  if(t!==cur)return;
+  const b=$('load');b.style.width=p+'%';
+  if(p===100)setTimeout(()=>b.style.width='0',400);
+}
+function close(t){
+  const k=tabs.indexOf(t);t.f.remove();tabs.splice(k,1);
+  if(!tabs.length)return newTab();
+  if(cur===t)cur=tabs[Math.max(0,k-1)];
+  render();
+}
+function render(){
+  const bar=$('tabs');bar.innerHTML='';
+  tabs.forEach(t=>{
+    const d=document.createElement('div');d.className='tab'+(t===cur?' on':'');
+    d.innerHTML='<span></span><button title="Close tab">✕</button>';
+    d.firstChild.textContent=t.title;
+    d.onclick=()=>{cur=t;render()};
+    d.lastChild.onclick=e=>{e.stopPropagation();close(t)};
+    bar.appendChild(d);
+  });
+  const nb=document.createElement('button');nb.textContent='+';nb.title='New tab';nb.onclick=()=>newTab();bar.appendChild(nb);
+  const home=cur.url===HOME;
+  tabs.forEach(t=>t.f.classList.toggle('on',t===cur&&t.url!==HOME&&!t.error));
+  $('home').style.display=home?'flex':'none';
+  if(home)renderHome();
+  $('err').style.display=cur.error&&!home?'flex':'none';
+  if(cur.error)$('err').innerHTML='<h1>Couldn’t load page</h1><p></p><p>The public proxies may be down, rate-limited, or blocked by that site. Try again, or try a simpler site.</p>',$('err').querySelector('p').textContent=cur.error;
+  if(document.activeElement!==$('url'))$('url').value=home?'':cur.url;
+  $('back').disabled=cur.i<=0;$('fwd').disabled=cur.i>=cur.hist.length-1;
+  document.title=cur.title+' – Browserception';
+}
+function renderHome(){
+  const h=$('home');if(h.dataset.built)return;h.dataset.built=1;
+  h.innerHTML='<h1>Browserception</h1><form><input placeholder="Search Wikipedia or type a URL" autofocus></form><div id="tiles"></div><p>Pages are fetched through public CORS proxies and rendered without JavaScript, so static and server-rendered sites work best.</p>';
+  const inp=h.querySelector('input');
+  h.querySelector('form').onsubmit=e=>{e.preventDefault();const v=inp.value;inp.value='';go(cur,v)};
+  SITES.forEach(s=>{const d=document.createElement('div');d.className='tile';d.textContent=s[0];d.onclick=()=>go(cur,s[1]);$('tiles').appendChild(d)});
+}
+function step(d){const k=cur.i+d;if(k<0||k>=cur.hist.length)return;cur.i=k;load(cur,cur.hist[k])}
+
+window.addEventListener('message',e=>{
+  if(!e.data||e.data.bc!=='nav')return;
+  const t=tabs.find(t=>t.f.contentWindow===e.source);
+  if(t&&/^https?:/i.test(e.data.url))go(t,e.data.url);
+});
+$('back').onclick=()=>step(-1);
+$('fwd').onclick=()=>step(1);
+$('reload').onclick=()=>load(cur,cur.url);
+$('homebtn').onclick=()=>go(cur,HOME);
+$('url').onkeydown=e=>{if(e.key==='Enter'){go(cur,e.target.value);e.target.blur()}};
+$('url').onfocus=e=>e.target.select();
+newTab();
+</script>
+</body>
+</html>
